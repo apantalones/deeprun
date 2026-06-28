@@ -1,0 +1,921 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { AppStore } from "../lib/project-store.js";
+
+const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
+
+if (!databaseUrl) {
+  throw new Error("deeprun CLI tests require DATABASE_URL or TEST_DATABASE_URL.");
+}
+
+const requiredDatabaseUrl: string = databaseUrl;
+
+interface RunningServer {
+  baseUrl: string;
+  stop: () => Promise<void>;
+}
+
+interface CliResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+function parseKeyValueLines(output: string): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const line of output.split("\n")) {
+    const index = line.indexOf("=");
+    if (index <= 0) {
+      continue;
+    }
+
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim();
+
+    if (!key) {
+      continue;
+    }
+
+    result[key] = value;
+  }
+
+  return result;
+}
+
+async function acquireFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("Could not allocate free port for server test."));
+        return;
+      }
+
+      const selected = address.port;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(selected);
+      });
+    });
+  });
+}
+
+async function waitForHealthy(baseUrl: string, child: ReturnType<typeof spawn>): Promise<void> {
+  const startedAt = Date.now();
+  const timeoutMs = 45_000;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (child.exitCode !== null) {
+      throw new Error(`Server process exited early with code ${String(child.exitCode)}.`);
+    }
+
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      if (response.ok) {
+        return;
+      }
+    } catch {
+      // Continue polling until timeout.
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error("Timed out waiting for server health endpoint.");
+}
+
+async function startServer(envOverrides: Record<string, string | undefined> = {}): Promise<RunningServer> {
+  const port = await acquireFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tsxCliPath = path.resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+
+  const child = spawn(process.execPath, [tsxCliPath, "-r", "dotenv/config", "src/server.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DATABASE_URL: requiredDatabaseUrl,
+      PORT: String(port),
+      NODE_ENV: "test",
+      CORS_ALLOWED_ORIGINS: process.env.CORS_ALLOWED_ORIGINS || "http://localhost",
+      RATE_LIMIT_LOGIN_MAX: process.env.RATE_LIMIT_LOGIN_MAX || "100",
+      RATE_LIMIT_GENERATION_MAX: process.env.RATE_LIMIT_GENERATION_MAX || "100",
+      AGENT_LIGHT_VALIDATION_MODE: "off",
+      AGENT_HEAVY_VALIDATION_MODE: "off",
+      AGENT_HEAVY_INSTALL_DEPS: "false",
+      ...envOverrides
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  child.stdout.on("data", () => undefined);
+  child.stderr.on("data", () => undefined);
+
+  await waitForHealthy(baseUrl, child);
+
+  return {
+    baseUrl,
+    async stop() {
+      if (child.exitCode !== null) {
+        return;
+      }
+
+      child.kill("SIGTERM");
+      await Promise.race([
+        once(child, "exit"),
+        new Promise((resolve) => setTimeout(resolve, 4_000))
+      ]);
+
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit").catch(() => undefined);
+      }
+    }
+  };
+}
+
+async function runCli(args: string[], envOverrides: Record<string, string | undefined> = {}): Promise<CliResult> {
+  const tsxCliPath = path.resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [tsxCliPath, "-r", "dotenv/config", "src/scripts/deeprun-cli.ts", ...args],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          ...envOverrides
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        code,
+        stdout,
+        stderr
+      });
+    });
+  });
+}
+
+test("deeprun CLI supports init -> run(kernel) -> status -> validate", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const goalFilePath = path.join(tmpDir, "goal.md");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-${suffix}@example.com`;
+
+  try {
+    await writeFile(
+      goalFilePath,
+      `Build kernel run ${suffix} from a goal file.\n${"Include detailed backend requirements. ".repeat(40)}`,
+      "utf8"
+    );
+
+
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Tester ${suffix}`,
+        "--org",
+        `CLI Org ${suffix}`,
+        "--workspace",
+        `CLI Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+    assert.match(initResult.stdout, /Initialized deeprun CLI session\./);
+    assert.match(initResult.stdout, /WORKSPACE_ID=/);
+
+    const runResult = await runCli(
+      [
+        "run",
+        "--goal-file",
+        goalFilePath,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Kernel Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+    assert.equal(runKv.ENGINE, "kernel");
+    assert.equal(runKv.RUN_STATUS, "complete");
+
+    const statusResult = await runCli(
+      ["status", "--engine", "kernel", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(statusResult.code, 0, `status failed: ${statusResult.stderr}`);
+
+    const statusKv = parseKeyValueLines(statusResult.stdout);
+    assert.equal(statusKv.PROJECT_ID, runKv.PROJECT_ID);
+    assert.equal(statusKv.RUN_ID, runKv.RUN_ID);
+    assert.equal(statusKv.ENGINE, "kernel");
+    assert.equal(statusKv.RUN_STATUS, "complete");
+    assert.ok(statusKv.CORRECTION_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_ATTEMPTS !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_PASSED !== undefined);
+    assert.ok(statusKv.CORRECTION_POLICY_FAILED !== undefined);
+    assert.ok(statusKv.OPEN_STUB_DEBT_COUNT !== undefined);
+    assert.ok(statusKv.STUB_MARKER_COUNT !== undefined);
+    assert.ok(statusKv.LAST_STUB_PATH !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_ACTION !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_STATUS !== undefined);
+    assert.ok(statusKv.LAST_STUB_PAYDOWN_AT !== undefined);
+    assert.equal(statusKv.EXECUTION_PROFILE, "ci");
+    assert.equal(statusKv.EXECUTION_SCHEMA_VERSION, "1");
+    assert.equal(statusKv.EXECUTION_HEAVY_VALIDATION_MODE, "off");
+
+    const logsResult = await runCli(
+      ["logs", "--engine", "kernel", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(logsResult.code, 0, `logs failed: ${logsResult.stderr}\n${logsResult.stdout}`);
+    assert.match(logsResult.stdout, /KERNEL_RUN_LOGS run=/);
+    assert.match(logsResult.stdout, /correctionPolicies=/);
+
+    const validateResult = await runCli(
+      ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        AGENT_HEAVY_INSTALL_DEPS: "false"
+      }
+    );
+
+    const validateKv = parseKeyValueLines(validateResult.stdout);
+    assert.equal(validateKv.PROJECT_ID, runKv.PROJECT_ID);
+    assert.equal(validateKv.RUN_ID, runKv.RUN_ID);
+    assert.ok(validateKv.VALIDATION_OK === "true" || validateKv.VALIDATION_OK === "false");
+    assert.ok(validateKv.BLOCKING_COUNT !== undefined);
+    assert.ok(validateKv.WARNING_COUNT !== undefined);
+
+    if (validateKv.VALIDATION_OK === "true") {
+      assert.equal(validateResult.code, 0);
+    } else {
+      assert.equal(validateResult.code, 1);
+    }
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI supports backend bootstrap command", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-bootstrap-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-bootstrap-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Bootstrap Tester ${suffix}`,
+        "--org",
+        `CLI Bootstrap Org ${suffix}`,
+        "--workspace",
+        `CLI Bootstrap Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const bootstrapResult = await runCli(
+      [
+        "bootstrap",
+        `Bootstrap backend ${suffix}`,
+        "--project-name",
+        `CLI Bootstrap Project ${suffix}`,
+        "--provider",
+        "mock"
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    const bootstrapKv = parseKeyValueLines(bootstrapResult.stdout);
+    assert.ok(bootstrapKv.PROJECT_ID, `bootstrap output missing PROJECT_ID: ${bootstrapResult.stdout}`);
+    assert.ok(bootstrapKv.RUN_ID, `bootstrap output missing RUN_ID: ${bootstrapResult.stdout}`);
+    assert.equal(bootstrapKv.ENGINE, "kernel");
+    assert.equal(bootstrapKv.RUN_STATUS, "complete");
+    assert.ok(
+      bootstrapKv.CERTIFICATION_OK === "true" || bootstrapKv.CERTIFICATION_OK === "false",
+      `bootstrap output missing CERTIFICATION_OK: ${bootstrapResult.stdout}`
+    );
+    assert.ok(
+      bootstrapKv.CERTIFICATION_BLOCKING_COUNT !== undefined,
+      `bootstrap output missing CERTIFICATION_BLOCKING_COUNT: ${bootstrapResult.stdout}`
+    );
+    assert.ok(
+      bootstrapKv.CERTIFICATION_WARNING_COUNT !== undefined,
+      `bootstrap output missing CERTIFICATION_WARNING_COUNT: ${bootstrapResult.stdout}`
+    );
+    assert.ok(
+      typeof bootstrapKv.CERTIFICATION_SUMMARY === "string" && bootstrapKv.CERTIFICATION_SUMMARY.length > 0,
+      `bootstrap output missing CERTIFICATION_SUMMARY: ${bootstrapResult.stdout}`
+    );
+    if (bootstrapKv.CERTIFICATION_OK === "true") {
+      assert.equal(bootstrapResult.code, 0, `bootstrap should succeed on certified pass: ${bootstrapResult.stderr}`);
+      assert.equal(bootstrapKv.CERTIFICATION_BLOCKING_COUNT, "0");
+    } else {
+      assert.equal(bootstrapResult.code, 2, `bootstrap should fail-fast on certification failure: ${bootstrapResult.stdout}`);
+      assert.match(bootstrapResult.stderr, /bootstrap certification failed/i);
+    }
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI promote is blocked until validation passes", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-gate-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote Tester ${suffix}`,
+        "--org",
+        `CLI Promote Org ${suffix}`,
+        "--workspace",
+        `CLI Promote Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Promote Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `promote should fail without validation: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /(promotion blocked|run has not been validated)/i);
+    assert.match(promoteResult.stderr, /(validate|validated)/i);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI promote --strict-v1-ready runs preflight and blocks deployment on v1 failure", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-promote-strict-v1-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-promote-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Promote V1 Tester ${suffix}`,
+        "--org",
+        `CLI Promote V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Promote V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict promote ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Promote V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const promoteResult = await runCli(
+      ["promote", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(promoteResult.code, 1, `strict promote should fail preflight: ${promoteResult.stdout}`);
+    assert.match(promoteResult.stderr, /strict v1-ready preflight failed/i);
+
+    const promoteKv = parseKeyValueLines(promoteResult.stdout);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_PROJECT_ID, runKv.PROJECT_ID);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_RUN_ID, runKv.RUN_ID);
+    assert.ok(promoteKv.PROMOTE_PREFLIGHT_VALIDATION_OK !== undefined, `missing preflight validation output: ${promoteResult.stdout}`);
+    assert.equal(promoteKv.PROMOTE_PREFLIGHT_V1_READY_OK, "false");
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI validate --strict-v1-ready emits v1-ready summary keys", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-validate-v1-ready-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-validate-v1-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Validate V1 Tester ${suffix}`,
+        "--org",
+        `CLI Validate V1 Org ${suffix}`,
+        "--workspace",
+        `CLI Validate V1 Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for strict v1 validate ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI Validate V1 Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const validateResult = await runCli(
+      ["validate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(validateResult.code, 1, `strict v1 validate should fail when docker checks fail: ${validateResult.stdout}`);
+    const validateKv = parseKeyValueLines(validateResult.stdout);
+    assert.ok(validateKv.V1_READY_OK !== undefined, `missing V1_READY_OK: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_VERDICT !== undefined, `missing V1_READY_VERDICT: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_TARGET !== undefined, `missing V1_READY_TARGET: ${validateResult.stdout}`);
+    assert.ok(validateKv.V1_READY_GENERATED_AT !== undefined, `missing V1_READY_GENERATED_AT: ${validateResult.stdout}`);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI gate emits PASS governance-decision.json for validated run", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-gate-pass-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const outputPath = path.join(tmpDir, "governance-decision.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-gate-pass-${suffix}@example.com`;
+  const store = new AppStore();
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Gate Pass Tester ${suffix}`,
+        "--org",
+        `CLI Gate Pass Org ${suffix}`,
+        "--workspace",
+        `CLI Gate Pass Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for governance pass ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Gate Pass Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    const project = await store.getProject(runKv.PROJECT_ID);
+    assert.ok(project, "expected persisted project for gate pass test");
+    assert.ok(await store.getAgentRun(runKv.RUN_ID), "expected persisted run for gate pass test");
+    await store.updateAgentRun(runKv.RUN_ID, {
+      validationStatus: "passed",
+      validationResult: {
+        targetPath: store.getProjectWorkspacePath(project),
+        validation: {
+          ok: true,
+          blockingCount: 0,
+          warningCount: 0,
+          summary: "all checks passed",
+          checks: []
+        }
+      },
+      validatedAt: new Date().toISOString()
+    });
+
+    const gateResult = await runCli(
+      ["gate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--output", outputPath],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(gateResult.code, 0, `gate should pass: ${gateResult.stderr}\n${gateResult.stdout}`);
+    const payload = JSON.parse(gateResult.stdout) as {
+      decision: string;
+      decisionHash: string;
+      reasonCodes: string[];
+      runId: string;
+      contract: { hash: string; plannerPolicyVersion: number };
+    };
+    assert.equal(payload.decision, "PASS");
+    assert.equal(payload.runId, runKv.RUN_ID);
+    assert.deepEqual(payload.reasonCodes, []);
+    assert.ok(payload.contract.hash.length > 10);
+    assert.equal(payload.contract.plannerPolicyVersion >= 1, true);
+    assert.equal(payload.decisionHash.length, 64);
+
+    const written = JSON.parse(await readFile(outputPath, "utf8")) as { decision: string; runId: string };
+    assert.equal(written.decision, "PASS");
+    assert.equal(written.runId, runKv.RUN_ID);
+
+    const contentAddressedPath = path.join(tmpDir, ".deeprun", "decisions", `${payload.decisionHash}.json`);
+    const latestPath = path.join(tmpDir, ".deeprun", "decisions", "latest.json");
+    const contentAddressed = JSON.parse(await readFile(contentAddressedPath, "utf8")) as { decisionHash: string };
+    const latest = JSON.parse(await readFile(latestPath, "utf8")) as { decisionHash: string };
+    assert.equal(contentAddressed.decisionHash, payload.decisionHash);
+    assert.equal(latest.decisionHash, payload.decisionHash);
+  } finally {
+    await store.close();
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI gate emits FAIL governance decision for strict v1-ready blockers", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-gate-fail-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-gate-fail-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Gate Fail Tester ${suffix}`,
+        "--org",
+        `CLI Gate Fail Org ${suffix}`,
+        "--workspace",
+        `CLI Gate Fail Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build kernel run for governance fail ${suffix}`,
+        "--engine",
+        "kernel",
+        "--provider",
+        "mock",
+        "--wait",
+        "--profile",
+        "ci",
+        "--project-name",
+        `CLI Gate Fail Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+
+    const gateResult = await runCli(
+      ["gate", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--strict-v1-ready"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl,
+        DEEPRUN_WORKSPACE_ROOT: tmpDir,
+        V1_DOCKER_BIN: "__missing_docker_binary__"
+      }
+    );
+
+    assert.equal(gateResult.code, 1, `gate should fail under strict v1-ready blockers: ${gateResult.stdout}`);
+    const payload = JSON.parse(gateResult.stdout) as {
+      decision: string;
+      decisionHash: string;
+      reasonCodes: string[];
+      reasons: Array<{ code: string }>;
+    };
+    assert.equal(payload.decision, "FAIL");
+    assert.equal(payload.reasonCodes.includes("RUN_V1_READY_FAILED"), true);
+    assert.equal(payload.reasons.some((entry) => entry.code === "RUN_V1_READY_FAILED"), true);
+
+    const contentAddressedPath = path.join(tmpDir, ".deeprun", "decisions", `${payload.decisionHash}.json`);
+    const contentAddressed = JSON.parse(await readFile(contentAddressedPath, "utf8")) as { decision: string };
+    assert.equal(contentAddressed.decision, "FAIL");
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("deeprun CLI status --watch streams progress and --verbose enables http trace", async () => {
+  const server = await startServer();
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "deeprun-cli-status-watch-"));
+  const configPath = path.join(tmpDir, "cli.json");
+  const suffix = randomUUID().slice(0, 8);
+  const email = `cli-status-watch-${suffix}@example.com`;
+
+  try {
+    const initResult = await runCli(
+      [
+        "init",
+        "--api",
+        server.baseUrl,
+        "--email",
+        email,
+        "--password",
+        "Password123!",
+        "--name",
+        `CLI Status Watch Tester ${suffix}`,
+        "--org",
+        `CLI Status Watch Org ${suffix}`,
+        "--workspace",
+        `CLI Status Watch Workspace ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(initResult.code, 0, `init failed: ${initResult.stderr}`);
+
+    const runResult = await runCli(
+      [
+        "run",
+        `Build state run ${suffix}`,
+        "--engine",
+        "state",
+        "--provider",
+        "mock",
+        "--project-name",
+        `CLI State Project ${suffix}`
+      ],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(runResult.code, 0, `run failed: ${runResult.stderr}\n${runResult.stdout}`);
+    const runKv = parseKeyValueLines(runResult.stdout);
+    assert.ok(runKv.PROJECT_ID, `run output missing PROJECT_ID: ${runResult.stdout}`);
+    assert.ok(runKv.RUN_ID, `run output missing RUN_ID: ${runResult.stdout}`);
+
+    const watchResult = await runCli(
+      ["status", "--engine", "state", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--watch"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(watchResult.code, 0, `status --watch failed: ${watchResult.stderr}\n${watchResult.stdout}`);
+    assert.match(watchResult.stdout, /state status=/);
+    assert.match(watchResult.stdout, /RUN_STATUS=/);
+    assert.equal(watchResult.stdout.includes("[http]"), false);
+
+    const verboseResult = await runCli(
+      ["status", "--engine", "state", "--project", runKv.PROJECT_ID, "--run", runKv.RUN_ID, "--watch", "--verbose"],
+      {
+        DEEPRUN_CLI_CONFIG: configPath,
+        DATABASE_URL: requiredDatabaseUrl
+      }
+    );
+
+    assert.equal(verboseResult.code, 0, `status --watch --verbose failed: ${verboseResult.stderr}\n${verboseResult.stdout}`);
+    assert.match(verboseResult.stdout, /\[http\] GET /);
+    assert.match(verboseResult.stdout, /state status=/);
+  } finally {
+    await server.stop();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});

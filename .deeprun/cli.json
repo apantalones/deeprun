@@ -1,0 +1,18 @@
+{
+  "apiBaseUrl": "http://localhost:4000",
+  "cookies": {
+    "deeprun_at": "eyJ0eXBlIjoiYWNjZXNzIiwic2lkIjoiY2E1YWE1MjYtYjEyNS00YjUwLWJlZmYtNmNiNDJiOGVhZTgxIiwidWlkIjoiNzY3YzNjZGEtMDNkNy00NTFiLWFiNjMtZmY2Y2ExNzk1ZDAxIiwiZXhwIjoxNzc5MzMyNTIwLCJqdGkiOiI5NjY5MTk5YjMyMThmOWRiYmI1Zjk3YTEifQ.WIXKO5o2s3RetK2bOAGLsfPf-eYT_xarhH-GYVxIf5A",
+    "deeprun_rt": "eyJ0eXBlIjoicmVmcmVzaCIsInNpZCI6ImNhNWFhNTI2LWIxMjUtNGI1MC1iZWZmLTZjYjQyYjhlYWU4MSIsInVpZCI6Ijc2N2MzY2RhLTAzZDctNDUxYi1hYjYzLWZmNmNhMTc5NWQwMSIsImV4cCI6MTc4MTkyMzYyMCwianRpIjoiYWE1OWZjMjIxYWIwOGQxZWM0MWQyMmY5In0.95XlGyWivB9xfvUEv1g4as5afdbXV4io2xl2QT8ni3U"
+  },
+  "activeWorkspaceId": "7f065b8a-d4cd-466e-a2fe-55ff452c5d51",
+  "activeOrganizationId": "80dac19c-ac5b-49d3-8730-9e1fded95a4e",
+  "user": {
+    "id": "767c3cda-03d7-451b-ab63-ff6ca1795d01",
+    "email": "abusch261@gmail.com",
+    "name": "deeprun User",
+    "createdAt": "2026-05-21T02:25:53.987Z",
+    "updatedAt": "2026-05-21T02:25:53.987Z"
+  },
+  "lastProjectId": "13cab2b5-8933-4e76-b6e2-d177268cd41e",
+  "lastKernelRunId": "bbf45245-ed98-4b3a-8e3f-b3e81494f376"
+}

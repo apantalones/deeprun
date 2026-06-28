@@ -1,0 +1,38 @@
+{
+  "name": "@deeprun/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "start:api": "node -e \"process.env.DEEPRUN_PROCESS_ROLE='api'; import('./dist/server.js')\"",
+    "start:worker": "node -e \"process.env.DEEPRUN_PROCESS_ROLE='worker'; import('./dist/server.js')\"",
+    "start:all": "node -e \"process.env.DEEPRUN_PROCESS_ROLE='all'; import('./dist/server.js')\"",
+    "check": "tsc --noEmit",
+    "typecheck:governance": "tsc -p tsconfig.governance.json --noEmit",
+    "test:governance": "tsx --test src/governance/__tests__/artifacts.test.ts src/governance/__tests__/decision.test.ts src/governance/__tests__/decision-issuer.test.ts src/governance/__tests__/evidence.test.ts src/governance/__tests__/profiles.test.ts src/governance/__tests__/assessment-repository.test.ts src/governance/__tests__/authority-loader.test.ts src/governance/__tests__/governance-evaluator.test.ts src/governance/__tests__/governance-worker.test.ts",
+    "test:governance:integration": "tsx --test src/governance/__tests__/governance-postgres-integration.test.ts",
+    "test:governance:integration:ci": "node scripts/run-governance-integration-ci.mjs",
+    "test:governance:e2e": "npm run build && tsx --test src/governance/__tests__/governance-e2e.test.ts",
+    "test:governance:e2e:ci": "node scripts/run-governance-e2e-ci.mjs"
+  },
+  "dependencies": {
+    "cors": "2.8.6",
+    "dotenv": "16.6.1",
+    "express": "4.22.1",
+    "pg": "8.18.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/cors": "2.8.19",
+    "@types/express": "4.17.25",
+    "@types/node": "22.19.11",
+    "@types/pg": "8.16.0",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}
