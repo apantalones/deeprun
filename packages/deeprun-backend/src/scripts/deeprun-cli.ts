@@ -260,6 +260,7 @@ interface AssessJsonResult {
   evidenceManifestHash: string | null;
   reasonCodes: string[];
   exitCode: number;
+  terminal?: boolean;
   artifactId?: string;
   packaging?: PackagingDescriptor;
   error?: {
@@ -1265,6 +1266,18 @@ function parseRetryAfterMs(headers: Headers): number | undefined {
   return undefined;
 }
 
+function retryAfterMsFromError(error: ApiError): number | undefined {
+  const details =
+    error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? error.details as Record<string, unknown>
+      : null;
+  const retryAfterSeconds = Number(details?.retryAfterSeconds);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+    return Math.floor(retryAfterSeconds * 1000);
+  }
+  return undefined;
+}
+
 function isTransientStatus(status: number): boolean {
   return status === 429 || status === 502 || status === 503 || status === 504;
 }
@@ -1337,6 +1350,115 @@ async function pollAssessment(input: {
   throw new AssessmentPollTimeoutError(input.assessmentId, lastAssessment, input.timeoutMs);
 }
 
+function isV1ArtifactResponse(input: unknown): input is V1ArtifactResponse {
+  const candidate = input as Partial<V1ArtifactResponse> | null;
+  return Boolean(
+    candidate &&
+      typeof candidate.artifactId === "string" &&
+      typeof candidate.sourceTreeDigest === "string" &&
+      candidate.upload &&
+      typeof candidate.upload.digest === "string" &&
+      typeof candidate.upload.sizeBytes === "number"
+  );
+}
+
+function isV1AssessmentResponse(input: unknown): input is V1AssessmentResponse {
+  const candidate = input as Partial<V1AssessmentResponse> | null;
+  return Boolean(
+    candidate &&
+      typeof candidate.assessmentId === "string" &&
+      typeof candidate.status === "string" &&
+      candidate.subject &&
+      typeof candidate.subject.digest === "string"
+  );
+}
+
+async function createArtifactWithIdempotency(input: {
+  client: ApiClient;
+  organizationId: string;
+  filename: string;
+  bundleBytes: Buffer;
+  bundleDigest: string;
+  idempotencyKey: string;
+  timeoutMs: number;
+}): Promise<V1ArtifactResponse> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < input.timeoutMs) {
+    try {
+      const artifact = await input.client.requestRawOk<unknown>(
+        "POST",
+        `/v1/artifacts?organizationId=${encodeURIComponent(input.organizationId)}&filename=${input.filename}`,
+        input.bundleBytes,
+        "application/x-deeprun-source-bundle",
+        {
+          "Idempotency-Key": input.idempotencyKey,
+          "X-Artifact-SHA256": input.bundleDigest
+        }
+      );
+      if (!isV1ArtifactResponse(artifact)) {
+        throw new Error("Artifact idempotency response did not include an artifact.");
+      }
+      return artifact;
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 409) {
+        throw error;
+      }
+      const delayMs = Math.min(retryAfterMsFromError(error) ?? 1_000, 10_000);
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error(`Timed out waiting for artifact idempotency key ${input.idempotencyKey}.`);
+}
+
+async function createAssessmentWithIdempotency(input: {
+  client: ApiClient;
+  organizationId: string;
+  artifactId: string;
+  profile: string;
+  policy: string;
+  idempotencyKey: string;
+  timeoutMs: number;
+}): Promise<V1AssessmentResponse> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < input.timeoutMs) {
+    const response = await input.client.request<unknown>(
+      "POST",
+      "/v1/assessments",
+      {
+        organizationId: input.organizationId,
+        artifactId: input.artifactId,
+        profile: input.profile,
+        policy: input.policy
+      },
+      {
+        "Idempotency-Key": input.idempotencyKey
+      }
+    );
+
+    if (response.status >= 200 && response.status < 300) {
+      if (isV1AssessmentResponse(response.body)) {
+        return response.body;
+      }
+
+      const body = response.body as { status?: string };
+      if (response.status === 202 && body.status === "IN_PROGRESS") {
+        await sleep(Math.min(parseRetryAfterMs(response.headers) ?? 1_000, 10_000));
+        continue;
+      }
+    }
+
+    if (response.status < 200 || response.status >= 300) {
+      const body = response.body as { error?: string; details?: unknown };
+      throw new ApiError(response.status, body.error || `Request failed with HTTP ${response.status}.`, body.details);
+    }
+
+    throw new Error("Assessment idempotency response did not include an assessment.");
+  }
+
+  throw new Error(`Timed out waiting for assessment idempotency key ${input.idempotencyKey}.`);
+}
+
 function verifyIssuedDecision(decision: unknown): IssuedDecision {
   const parsed = issuedDecisionSchema.parse(decision);
   const recomputed = buildDecisionCoreHash(parsed.decisionCore);
@@ -1391,6 +1513,8 @@ function buildAssessJsonResult(input: {
   evidence?: V1EvidenceResponse;
   decision?: IssuedDecision;
   packaging?: PackagingDescriptor;
+  status?: string;
+  terminal?: boolean;
   error?: { code: string; message: string };
 }): AssessJsonResult {
   const decisionValue =
@@ -1399,13 +1523,14 @@ function buildAssessJsonResult(input: {
   return {
     resultSchemaVersion: 1,
     assessmentId: input.assessment?.assessmentId ?? null,
-    status: input.assessment?.status ?? "UNAVAILABLE",
+    status: input.status ?? input.assessment?.status ?? "UNAVAILABLE",
     decision: decisionValue,
     decisionHash: input.decision?.decisionHash ?? input.assessment?.decision?.decisionHash ?? null,
     subjectDigest: input.assessment?.subject.digest ?? input.artifact?.sourceTreeDigest ?? null,
     evidenceManifestHash: input.evidence?.evidenceManifestHash ?? null,
     reasonCodes: collectReasonCodes(input.evidence, input.decision),
     exitCode: input.exitCode,
+    ...(typeof input.terminal === "boolean" ? { terminal: input.terminal } : {}),
     ...(input.artifact ? { artifactId: input.artifact.artifactId } : {}),
     ...(input.packaging ? { packaging: input.packaging } : {}),
     ...(input.error ? { error: input.error } : {})
@@ -2331,12 +2456,19 @@ async function handleAssess(input: {
 
   const jar = new CookieJar(input.config.cookies);
   const client = new ApiClient(input.config.apiBaseUrl, jar, input.verbose);
-  const invocationId = randomUUID();
+  const invocationId =
+    optionString(input.options, "invocation-id") ||
+    (process.env.NODE_ENV === "test" ? String(process.env.DEEPRUN_TEST_INVOCATION_ID || "").trim() : "") ||
+    randomUUID();
   let tempRoot: string | null = null;
+  let artifact: V1ArtifactResponse | undefined;
+  let createdAssessment: V1AssessmentResponse | null = null;
+  let packaging: PackagingDescriptor | undefined;
 
   try {
     const bundle = await buildAssessmentBundle(sourcePath);
     tempRoot = bundle.tempRoot;
+    packaging = bundle.packaging;
 
     if (dryRun) {
       writePackagingDryRun({
@@ -2349,30 +2481,31 @@ async function handleAssess(input: {
 
     const bundleBytes = await readFile(bundle.bundlePath);
     const filename = encodeURIComponent(path.basename(path.resolve(sourcePath)) || "source");
-    const artifact = await client.requestRawOk<V1ArtifactResponse>(
-      "POST",
-      `/v1/artifacts?organizationId=${encodeURIComponent(organizationId as string)}&filename=${filename}`,
+    artifact = await createArtifactWithIdempotency({
+      client,
+      organizationId: organizationId as string,
+      filename,
       bundleBytes,
-      "application/x-deeprun-source-bundle",
-      {
-        "Idempotency-Key": `${invocationId}:artifact`,
-        "X-Artifact-SHA256": bundle.bundleDigest
-      }
-    );
+      bundleDigest: bundle.bundleDigest,
+      idempotencyKey: `${invocationId}:artifact`,
+      timeoutMs
+    });
 
     if (artifact.upload.digest !== bundle.bundleDigest || artifact.upload.sizeBytes !== bundle.sizeBytes) {
       process.stderr.write("Artifact upload integrity check failed against server response.\n");
       return 3;
     }
 
-    const created = await client.requestOk<V1AssessmentResponse>("POST", "/v1/assessments", {
+    const created = await createAssessmentWithIdempotency({
+      client,
       organizationId: organizationId as string,
       artifactId: artifact.artifactId,
       profile,
-      policy
-    }, {
-      "Idempotency-Key": `${invocationId}:assessment`
+      policy,
+      idempotencyKey: `${invocationId}:assessment`,
+      timeoutMs
     });
+    createdAssessment = created;
 
     if (noWait) {
       const exitCode = 2;
@@ -2479,12 +2612,18 @@ async function handleAssess(input: {
 
     return exitCode;
   } catch (error) {
-    const exitCode = error instanceof AssessmentPollTimeoutError ? 2 : classifyAssessError(error);
+    const exitCode = error instanceof AssessmentPollTimeoutError ? 6 : classifyAssessError(error);
+    const timedOutAssessment =
+      error instanceof AssessmentPollTimeoutError ? error.assessment ?? createdAssessment : null;
     if (outputJson) {
       writeAssessJsonResult(
         buildAssessJsonResult({
           exitCode,
-          assessment: error instanceof AssessmentPollTimeoutError ? error.assessment : null,
+          artifact,
+          assessment: timedOutAssessment,
+          packaging,
+          status: error instanceof AssessmentPollTimeoutError ? "TIMEOUT" : undefined,
+          terminal: error instanceof AssessmentPollTimeoutError ? false : undefined,
           error: {
             code: error instanceof AssessmentPollTimeoutError ? "CLIENT_TIMEOUT" : "CLIENT_ERROR",
             message: error instanceof Error ? error.message : String(error)
