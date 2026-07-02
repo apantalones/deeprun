@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { logError, logInfo, logWarn } from "../lib/logging.js";
 import type { GovernanceStore } from "./governance-store.js";
 import type { GovernanceEvaluator } from "./evaluator-types.js";
@@ -167,8 +169,23 @@ export class GovernanceWorker {
     // ------------------------------------------------------------------
     // Move job to RUNNING and assessment to RUNNING
     // ------------------------------------------------------------------
-    await this.governanceStore.transitionJobToRunning(jobId, this.workerId, leaseGeneration).catch(() => undefined);
+    const runningJob = await this.governanceStore.transitionJobToRunning(jobId, this.workerId, leaseGeneration).catch(() => null);
+    if (!runningJob) {
+      logWarn("governance.worker.running_transition_lost", {
+        workerId: this.workerId,
+        jobId,
+        assessmentId,
+        attemptId,
+        leaseGeneration
+      });
+      return;
+    }
     await this.governanceStore.updateAssessmentStatus(assessmentId, "RUNNING").catch(() => undefined);
+
+    await this.pauseAfterJobRunningForTest(runningJob, externalSignal);
+    if (externalSignal?.aborted) {
+      return;
+    }
 
     // ------------------------------------------------------------------
     // Start heartbeat
@@ -278,5 +295,52 @@ export class GovernanceWorker {
       clearInterval(heartbeatTimer);
       this.heartbeatTimers.delete(jobId);
     }
+  }
+
+  private async pauseAfterJobRunningForTest(
+    job: GovernanceJobRecord,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (
+      process.env.NODE_ENV !== "test" ||
+      process.env.DEEPRUN_TEST_PAUSE_AFTER_JOB_RUNNING !== "true"
+    ) {
+      return;
+    }
+
+    const markerPath = process.env.DEEPRUN_TEST_JOB_RUNNING_MARKER;
+    if (markerPath) {
+      await mkdir(path.dirname(markerPath), { recursive: true });
+      await writeFile(
+        markerPath,
+        `${JSON.stringify({
+          assessmentId: job.assessmentId,
+          attemptId: job.attemptId,
+          jobId: job.jobId,
+          workerId: this.workerId,
+          leaseGeneration: job.leaseGeneration,
+          leaseExpiresAt: job.leaseExpiresAt
+        })}\n`,
+        "utf8"
+      );
+    }
+
+    logInfo("governance.worker.test_pause_after_job_running", {
+      assessmentId: job.assessmentId,
+      attemptId: job.attemptId,
+      jobId: job.jobId,
+      workerId: this.workerId,
+      leaseGeneration: job.leaseGeneration,
+      leaseExpiresAt: job.leaseExpiresAt,
+      markerPath: markerPath ?? null
+    });
+
+    if (!signal || signal.aborted) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
   }
 }

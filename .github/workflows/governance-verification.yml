@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    defaults:
+      run:
+        working-directory: packages/deeprun-backend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,6 +108,7 @@ jobs:
         working-directory: packages/deeprun-backend
 
     env:
+      DEEPRUN_GOVERNANCE_E2E_REQUIRE_DB: "true"
       TEST_DATABASE_URL: postgres://deeprun_test:deeprun_test@localhost:5432/deeprun_governance_test
       ARTIFACTS_PATH: ${{ runner.temp }}/governance-e2e-artifacts
 

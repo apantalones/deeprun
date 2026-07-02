@@ -3146,6 +3146,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 # Copy built artifacts from builder
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma/client ./node_modules/@prisma/client
 

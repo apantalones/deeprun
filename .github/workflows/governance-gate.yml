@@ -41,6 +41,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/deeprun_test
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/deeprun_test
       NODE_ENV: test
+      JWT_SECRET: governance-gate-jwt-secret-at-least-thirty-two-chars
       AUTH_TOKEN_SECRET: governance-gate-ci-secret
       CORS_ALLOWED_ORIGINS: http://127.0.0.1:3012
       RATE_LIMIT_LOGIN_MAX: 500
@@ -48,6 +49,10 @@ jobs:
       AGENT_LIGHT_VALIDATION_MODE: off
       AGENT_HEAVY_VALIDATION_MODE: off
       AGENT_HEAVY_INSTALL_DEPS: "true"
+
+    defaults:
+      run:
+        working-directory: packages/deeprun-backend
 
     steps:
       - name: Checkout
@@ -58,6 +63,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: packages/deeprun-backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -113,7 +119,6 @@ jobs:
               --engine kernel \
               --provider mock \
               --profile ci \
-              --wait \
               --project-name "Governance Project ${suffix}" \
               > "${run_output}"
 
@@ -146,6 +151,7 @@ jobs:
                   throw new Error(`Project not found: ${process.env.PROJECT_ID || ""}`);
                 }
                 await store.updateAgentRun(process.env.RUN_ID || "", {
+                  status: "complete",
                   validationStatus: "passed",
                   validationResult: {
                     targetPath: store.getProjectWorkspacePath(project),
@@ -157,7 +163,10 @@ jobs:
                       checks: []
                     }
                   },
-                  validatedAt: new Date().toISOString()
+                  validatedAt: new Date().toISOString(),
+                  errorMessage: null,
+                  errorDetails: null,
+                  finishedAt: new Date().toISOString()
                 });
                 await store.close();
               '
@@ -272,6 +281,6 @@ jobs:
           name: governance-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: |
-            .deeprun/governance/**
-            .deeprun/fresh-integration/**
-            .deeprun/decisions/**
+            packages/deeprun-backend/.deeprun/governance/**
+            packages/deeprun-backend/.deeprun/fresh-integration/**
+            packages/deeprun-backend/.deeprun/decisions/**

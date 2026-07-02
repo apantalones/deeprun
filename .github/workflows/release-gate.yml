@@ -75,7 +75,6 @@ jobs:
         continue-on-error: true
         with:
           path: .artifacts
-          if-no-files-found: ignore
 
       - name: Publish release gate summary
         env:

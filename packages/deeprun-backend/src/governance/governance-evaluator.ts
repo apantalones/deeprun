@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { buildEvidenceCoreHash, finalizeEvidenceEnvelope } from "./evidence.js";
@@ -91,6 +91,20 @@ export class GovernanceEvaluatorImpl implements GovernanceEvaluator {
       await this.governanceStore.updateAttemptStatus(attemptId, "RUNNING", {
         workerId
       });
+
+      const forcedEvaluationError = await this.forceEvaluationErrorForTest({
+        assessmentId,
+        attemptId,
+        workspacePath
+      });
+      if (forcedEvaluationError) {
+        return forcedEvaluationError;
+      }
+
+      const delayed = await this.delayEvaluationForTest(signal);
+      if (delayed && signal?.aborted) {
+        return this.handleCancellation(assessmentId, attemptId, jobId, workerId, workspacePath, leaseGeneration);
+      }
 
       // -------------------------------------------------------------------
       // 3. Resolve and resolve the adapter for this profile
@@ -324,6 +338,13 @@ export class GovernanceEvaluatorImpl implements GovernanceEvaluator {
         manifestHash: manifestRecord.evidenceManifestHash
       });
 
+      await this.pauseAfterEvidenceFinalizationForTest({
+        assessmentId,
+        attemptId,
+        manifestHash: manifestRecord.evidenceManifestHash,
+        signal
+      });
+
       return { kind: "COMPLETE", manifestHash: manifestRecord.evidenceManifestHash };
     } catch (error) {
       // -------------------------------------------------------------------
@@ -399,6 +420,66 @@ export class GovernanceEvaluatorImpl implements GovernanceEvaluator {
       .catch(() => undefined);
     await this.cleanupWorkspace(workspacePath);
     return { kind: "CANCELLED" };
+  }
+
+  private async forceEvaluationErrorForTest(input: {
+    assessmentId: string;
+    attemptId: string;
+    workspacePath: string;
+  }): Promise<EvaluationOutcome | null> {
+    if (
+      process.env.NODE_ENV !== "test" ||
+      process.env.DEEPRUN_TEST_FORCE_EVALUATION_ERROR !== "true"
+    ) {
+      return null;
+    }
+
+    const errorCode = "TEST_FORCED_EVALUATION_ERROR";
+    const errorMessage = "Test-forced evaluation infrastructure error.";
+    logError("governance.evaluator.test_forced_evaluation_error", {
+      assessmentId: input.assessmentId,
+      attemptId: input.attemptId,
+      errorCode
+    });
+    await this.markAttemptError(input.attemptId, errorCode, errorMessage).catch(() => undefined);
+    await this.cleanupWorkspace(input.workspacePath);
+
+    return {
+      kind: "INFRASTRUCTURE_ERROR",
+      errorCode,
+      errorMessage,
+      retryable: false
+    };
+  }
+
+  private async delayEvaluationForTest(signal?: AbortSignal): Promise<boolean> {
+    if (process.env.NODE_ENV !== "test") {
+      return false;
+    }
+
+    const rawDelayMs = process.env.DEEPRUN_TEST_EVALUATION_DELAY_MS;
+    if (!rawDelayMs) {
+      return false;
+    }
+
+    const delayMs = Math.max(0, Math.min(Number(rawDelayMs), 60_000));
+    if (!Number.isFinite(delayMs) || delayMs <= 0) {
+      return false;
+    }
+
+    logInfo("governance.evaluator.test_evaluation_delay", { delayMs });
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, delayMs);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true }
+      );
+    });
+    return true;
   }
 
   private async markAttemptError(
@@ -488,6 +569,49 @@ export class GovernanceEvaluatorImpl implements GovernanceEvaluator {
         error: error instanceof Error ? error.message : String(error)
       });
     }
+  }
+
+  private async pauseAfterEvidenceFinalizationForTest(input: {
+    assessmentId: string;
+    attemptId: string;
+    manifestHash: string;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (
+      process.env.NODE_ENV !== "test" ||
+      process.env.DEEPRUN_TEST_PAUSE_AFTER_EVIDENCE_FINALIZATION !== "true"
+    ) {
+      return;
+    }
+
+    const markerPath = process.env.DEEPRUN_TEST_EVIDENCE_FINALIZED_MARKER;
+    if (markerPath) {
+      await mkdir(path.dirname(markerPath), { recursive: true });
+      await writeFile(
+        markerPath,
+        `${JSON.stringify({
+          assessmentId: input.assessmentId,
+          attemptId: input.attemptId,
+          manifestHash: input.manifestHash
+        })}\n`,
+        "utf8"
+      );
+    }
+
+    logInfo("governance.evaluator.test_pause_after_evidence_finalization", {
+      assessmentId: input.assessmentId,
+      attemptId: input.attemptId,
+      manifestHash: input.manifestHash,
+      markerPath: markerPath ?? null
+    });
+
+    if (!input.signal || input.signal.aborted) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      input.signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
   }
 }
 

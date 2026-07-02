@@ -58,6 +58,10 @@ jobs:
       DRY_RUN_TARGET_INPUT: ${{ inputs.target_path || github.event.inputs.target_path }}
       DRY_RUN_TEMPLATE_INPUT: ${{ inputs.template_id || github.event.inputs.template_id || 'canonical-backend' }}
 
+    defaults:
+      run:
+        working-directory: packages/deeprun-backend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,6 +71,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: packages/deeprun-backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -101,5 +106,5 @@ jobs:
           name: deployment-dry-run-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: |
-            .deeprun/deployment-dry-run-report.json
-            .deeprun/deployment-dry-run-target
+            packages/deeprun-backend/.deeprun/deployment-dry-run-report.json
+            packages/deeprun-backend/.deeprun/deployment-dry-run-target
