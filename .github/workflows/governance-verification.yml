@@ -64,7 +64,7 @@ jobs:
 
     env:
       TEST_DATABASE_URL: postgres://deeprun_test:deeprun_test@localhost:5432/deeprun_governance_test
-      ARTIFACTS_PATH: ${{ runner.temp }}/governance-artifacts
+      ARTIFACTS_PATH: /tmp/governance-artifacts
 
     steps:
       - name: Checkout
@@ -110,7 +110,7 @@ jobs:
     env:
       DEEPRUN_GOVERNANCE_E2E_REQUIRE_DB: "true"
       TEST_DATABASE_URL: postgres://deeprun_test:deeprun_test@localhost:5432/deeprun_governance_test
-      ARTIFACTS_PATH: ${{ runner.temp }}/governance-e2e-artifacts
+      ARTIFACTS_PATH: /tmp/governance-e2e-artifacts
 
     steps:
       - name: Checkout
