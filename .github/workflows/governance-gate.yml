@@ -49,6 +49,10 @@ jobs:
       AGENT_HEAVY_VALIDATION_MODE: off
       AGENT_HEAVY_INSTALL_DEPS: "true"
 
+    defaults:
+      run:
+        working-directory: packages/deeprun-backend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,6 +62,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: packages/deeprun-backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -272,6 +277,6 @@ jobs:
           name: governance-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: |
-            .deeprun/governance/**
-            .deeprun/fresh-integration/**
-            .deeprun/decisions/**
+            packages/deeprun-backend/.deeprun/governance/**
+            packages/deeprun-backend/.deeprun/fresh-integration/**
+            packages/deeprun-backend/.deeprun/decisions/**

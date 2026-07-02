@@ -106,6 +106,10 @@ jobs:
       INPUT_STRESS_NEGATIVE_MAX_RUNS: ${{ inputs.stress_negative_max_runs || github.event.inputs.stress_negative_max_runs || '40' }}
       INPUT_STRESS_SNAPSHOT_EVERY: ${{ inputs.stress_snapshot_every || github.event.inputs.stress_snapshot_every || '20' }}
 
+    defaults:
+      run:
+        working-directory: packages/deeprun-backend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,6 +119,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: packages/deeprun-backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -282,8 +287,8 @@ jobs:
           name: reliability-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: |
-            .deeprun/reliability-report.json
-            .deeprun/reliability-report.retry.json
-            .deeprun/reliability-server.log
-            .deeprun/reliability-matrix/**
-            .deeprun/stress/**
+            packages/deeprun-backend/.deeprun/reliability-report.json
+            packages/deeprun-backend/.deeprun/reliability-report.retry.json
+            packages/deeprun-backend/.deeprun/reliability-server.log
+            packages/deeprun-backend/.deeprun/reliability-matrix/**
+            packages/deeprun-backend/.deeprun/stress/**
