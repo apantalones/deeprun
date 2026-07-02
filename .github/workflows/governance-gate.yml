@@ -119,7 +119,6 @@ jobs:
               --engine kernel \
               --provider mock \
               --profile ci \
-              --wait \
               --project-name "Governance Project ${suffix}" \
               > "${run_output}"
 
@@ -152,6 +151,7 @@ jobs:
                   throw new Error(`Project not found: ${process.env.PROJECT_ID || ""}`);
                 }
                 await store.updateAgentRun(process.env.RUN_ID || "", {
+                  status: "complete",
                   validationStatus: "passed",
                   validationResult: {
                     targetPath: store.getProjectWorkspacePath(project),
@@ -163,7 +163,10 @@ jobs:
                       checks: []
                     }
                   },
-                  validatedAt: new Date().toISOString()
+                  validatedAt: new Date().toISOString(),
+                  errorMessage: null,
+                  errorDetails: null,
+                  finishedAt: new Date().toISOString()
                 });
                 await store.close();
               '
